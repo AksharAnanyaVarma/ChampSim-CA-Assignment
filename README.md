@@ -51,13 +51,13 @@ from the 15-trace list, using a fixed seed. **Seed 42** picked: `619.lbm` (core 
 ```
 .
 ├── README.md                     # this file
-├── report.pdf                    # full results document (all tasks)
-├── random_trace_gen.py           # 4-core trace picker (seed 42)
+├── Final_report.pdf                    # full results document (all tasks)
 ├── code/                         # copies of the files I added/changed
 │   ├── bullseye.bpred
 │   ├── bullseye_adaptive.bpred
 │   ├── mru.llc_repl
 │   ├── random.llc_repl
+|   ├── random_trace_gen.py
 │   └── hcit.llc_repl
 ├── results/
 │   ├── tables/                   # the CSV files used to build the report
