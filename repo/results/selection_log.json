@@ -1,0 +1,27 @@
+{
+  "seed": 42,
+  "timestamp": "2026-07-18 02:51:06.086880",
+  "pool": [
+    "401.bzip2-277B",
+    "403.gcc-16B",
+    "434.zeusmp-10B",
+    "437.leslie3d-273B",
+    "450.soplex-92B",
+    "456.hmmer-327B",
+    "462.libquantum-1343B",
+    "482.sphinx3-1522B",
+    "605.mcf_s-1644B",
+    "605.mcf_s-665B",
+    "619.lbm_s-3766B",
+    "620.omnetpp_s-874B",
+    "621.wrf_s-8100B",
+    "623.xalancbmk_s-700B",
+    "628.pop2_s-17B"
+  ],
+  "selected": [
+    "619.lbm_s-3766B",
+    "403.gcc-16B",
+    "401.bzip2-277B",
+    "620.omnetpp_s-874B"
+  ]
+}

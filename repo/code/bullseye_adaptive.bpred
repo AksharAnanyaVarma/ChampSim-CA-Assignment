@@ -1,0 +1,297 @@
+// Modified Bullseye Branch Predictor
+// Base: hashed perceptron (per assignment flowchart)
+// H2P subsystem inspired by Behrendt, Pun, Nair, "Taming Wild Branches", CBP 2025
+
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdlib.h>
+#include "ooo_cpu.h"
+
+/* ---------------- BASE: hashed perceptron ---------------- */
+#define NTABLES 16
+#define MAXHIST 232
+#define MINHIST 3
+#define SPEED   18
+int history_lengths[NTABLES] = {0,3,4,6,8,10,14,19,26,36,49,67,91,125,170,MAXHIST};
+#define LOG_TABLE_SIZE 12
+#define TABLE_SIZE (1<<LOG_TABLE_SIZE)
+#define NGHIST_WORDS (MAXHIST/LOG_TABLE_SIZE+1)
+
+int tables[NUM_CPUS][NTABLES][TABLE_SIZE];
+unsigned int ghist_words[NUM_CPUS][NGHIST_WORDS];
+unsigned int indices[NUM_CPUS][NTABLES];
+int theta[NUM_CPUS], tc[NUM_CPUS], yout[NUM_CPUS];
+
+/* ---------------- HIT: Hard-to-Predict Identification Table ---------------- */
+#define HIT_SETS  64
+#define HIT_WAYS  8
+/* Adaptive thresholds (paper Eq. 1a-1d), scaled for ChampSim's
+   hashed-perceptron base rather than TAGE-SC-L. */
+#define EXEC_BASE      512     // relaxed vs fixed 2048
+#define EXEC_PER_H2P   64      // tighten as population grows
+#define MISPRED_BASE   32      // relaxed vs fixed 256
+#define MISPRED_PER_H2P 8
+
+// f(N): accuracy ceiling tightens as N_H2P grows
+static inline double acc_ceiling(int N) {
+    if (N < 8)  return 0.995 - 0.005 * N / 8.0;
+    if (N <= 24) return 0.99 - 0.01 * (N - 8) / 16.0;
+    return 0.90;
+}
+
+struct hit_entry_t {
+    uint64_t tag;
+    uint32_t exec;
+    uint32_t mispred;
+    uint8_t  valid;
+    uint8_t  h2p_active;
+    uint32_t lru;
+};
+hit_entry_t hit_table[NUM_CPUS][HIT_SETS][HIT_WAYS];
+uint32_t hit_lru_clock[NUM_CPUS];
+
+/* ---------------- Mini perceptron layer ---------------- */
+#define MAX_H2P        32
+#define LOCAL_HIST_LEN 24
+#define MINI_WEIGHTS   (LOCAL_HIST_LEN+1)
+#define MINI_THETA     (int)(1.93*LOCAL_HIST_LEN+14)
+#define WARMUP_OCC     512
+#define WINRATE_MAX    64
+#define WINRATE_GATE   8
+
+struct h2p_entry_t {
+    uint64_t pc;
+    uint8_t  valid;
+    int      weights[MINI_WEIGHTS];
+    uint32_t local_hist;
+    uint32_t occurrences;
+    uint32_t mini_correct;
+    uint32_t mini_total;
+    int32_t  winrate;      // saturating: mini wins vs base wins
+};
+h2p_entry_t h2p[NUM_CPUS][MAX_H2P];
+int  h2p_fifo_next[NUM_CPUS];
+int  n_h2p[NUM_CPUS];
+
+/* per-prediction saved state */
+int      s_h2p_idx[NUM_CPUS];
+int      s_mini_out[NUM_CPUS];
+uint8_t  s_base_pred[NUM_CPUS];
+uint8_t  s_used_mini[NUM_CPUS];
+
+/* stats */
+uint64_t stat_overrides[NUM_CPUS];
+uint64_t stat_h2p_admitted[NUM_CPUS];
+uint64_t stat_override_right[NUM_CPUS];
+uint64_t stat_override_wrong[NUM_CPUS];
+uint64_t stat_base_would_be_right[NUM_CPUS];
+uint64_t stat_total_branches[NUM_CPUS];
+
+static inline uint32_t hit_set_index(uint64_t pc) { return (pc >> 2) & (HIT_SETS-1); }
+static inline uint64_t hit_tag(uint64_t pc)       { return (pc >> 2) >> 6; }
+
+static int find_h2p(uint32_t c, uint64_t pc) {
+    for (int i=0; i<MAX_H2P; i++)
+        if (h2p[c][i].valid && h2p[c][i].pc == pc) return i;
+    return -1;
+}
+
+static void admit_h2p(uint32_t c, uint64_t pc) {
+    int idx = h2p_fifo_next[c];
+    if (h2p[c][idx].valid) n_h2p[c]--;
+    memset(&h2p[c][idx], 0, sizeof(h2p_entry_t));
+    h2p[c][idx].pc    = pc;
+    h2p[c][idx].valid = 1;
+    n_h2p[c]++;
+    stat_h2p_admitted[c]++;
+    h2p_fifo_next[c] = (idx+1) % MAX_H2P;
+}
+
+static int mini_predict(uint32_t c, int idx) {
+    h2p_entry_t *e = &h2p[c][idx];
+    int out = e->weights[0];
+    for (int i=0; i<LOCAL_HIST_LEN; i++) {
+        int x = ((e->local_hist >> i) & 1) ? 1 : -1;
+        out += e->weights[i+1] * x;
+    }
+    return out;
+}
+
+static void mini_update(uint32_t c, int idx, uint8_t taken, int out) {
+    h2p_entry_t *e = &h2p[c][idx];
+    int pred = (out >= 0) ? 1 : 0;
+    int a = (out < 0) ? -out : out;
+    if (pred != taken || a <= MINI_THETA) {
+        int t = taken ? 1 : -1;
+        if (e->weights[0]*t < 127) e->weights[0] += t;
+        for (int i=0; i<LOCAL_HIST_LEN; i++) {
+            int x = ((e->local_hist >> i) & 1) ? 1 : -1;
+            int upd = t * x;
+            int *w = &e->weights[i+1];
+            if (upd > 0) { if (*w < 127)  (*w)++; }
+            else         { if (*w > -128) (*w)--; }
+        }
+    }
+    e->local_hist = ((e->local_hist << 1) | (taken?1:0)) & ((1u<<LOCAL_HIST_LEN)-1);
+    e->occurrences++;
+    e->mini_total++;
+    if (pred == taken) e->mini_correct++;
+}
+
+void O3_CPU::initialize_branch_predictor() {
+    cout << "CPU " << cpu << " Modified Bullseye branch predictor "
+         << "(base: hashed perceptron, H2P slots: " << MAX_H2P
+         << ", ADAPTIVE thresholds)" << endl;
+    memset(tables, 0, sizeof(tables));
+    memset(ghist_words, 0, sizeof(ghist_words));
+    memset(hit_table, 0, sizeof(hit_table));
+    memset(h2p, 0, sizeof(h2p));
+    for (int i=0; i<NUM_CPUS; i++) {
+        theta[i] = 10; tc[i] = 0;
+        h2p_fifo_next[i] = 0; n_h2p[i] = 0;
+        hit_lru_clock[i] = 0;
+        stat_overrides[i] = 0; stat_h2p_admitted[i] = 0;
+        stat_override_right[i] = 0; stat_override_wrong[i] = 0;
+        stat_base_would_be_right[i] = 0; stat_total_branches[i] = 0;
+    }
+}
+
+uint8_t O3_CPU::predict_branch(uint64_t pc) {
+    /* --- base hashed perceptron --- */
+    yout[cpu] = 0;
+    for (int i=0; i<NTABLES; i++) {
+        int n = history_lengths[i];
+        unsigned int x = 0;
+        int most_words = n / LOG_TABLE_SIZE;
+        int last_word  = n % LOG_TABLE_SIZE;
+        int j;
+        for (j=0; j<most_words; j++) x ^= ghist_words[cpu][j];
+        x ^= ghist_words[cpu][j] & ((1<<last_word)-1);
+        x ^= pc;
+        x &= TABLE_SIZE-1;
+        indices[cpu][i] = x;
+        yout[cpu] += tables[cpu][i][x];
+    }
+    uint8_t base_pred = (yout[cpu] >= 1);
+    s_base_pred[cpu]  = base_pred;
+    s_used_mini[cpu]  = 0;
+    s_h2p_idx[cpu]    = -1;
+
+    /* --- H2P override path --- */
+    int idx = find_h2p(cpu, pc);
+    if (idx >= 0) {
+        s_h2p_idx[cpu] = idx;
+        int out = mini_predict(cpu, idx);
+        s_mini_out[cpu] = out;
+        h2p_entry_t *e = &h2p[cpu][idx];
+        int a = (out < 0) ? -out : out;
+        int gate = WINRATE_GATE + (n_h2p[cpu] / 4);
+        if (e->occurrences >= WARMUP_OCC/4 && a > MINI_THETA/2 && e->winrate >= gate) {
+            s_used_mini[cpu] = 1;
+            stat_overrides[cpu]++;
+            return (out >= 0) ? 1 : 0;
+        }
+    }
+    return base_pred;
+}
+
+void O3_CPU::last_branch_result(uint64_t pc, uint8_t taken) {
+    bool base_correct = (taken == s_base_pred[cpu]);
+
+    stat_total_branches[cpu]++;
+    if (s_used_mini[cpu]) {
+        uint8_t mini_pred = (s_mini_out[cpu] >= 0) ? 1 : 0;
+        if (mini_pred == taken) stat_override_right[cpu]++;
+        else                    stat_override_wrong[cpu]++;
+        if (base_correct)       stat_base_would_be_right[cpu]++;
+    }
+    if ((stat_total_branches[cpu] % 1000000) == 0) {
+        cout << "[BULLSEYE-ADAPT cpu" << cpu << "] branches=" << stat_total_branches[cpu]
+             << " admitted=" << stat_h2p_admitted[cpu]
+             << " active=" << n_h2p[cpu]
+             << " overrides=" << stat_overrides[cpu]
+             << " ovr_right=" << stat_override_right[cpu]
+             << " ovr_wrong=" << stat_override_wrong[cpu]
+             << " base_right_when_ovr=" << stat_base_would_be_right[cpu]
+             << endl;
+    }
+
+    /* --- HIT bookkeeping --- */
+    uint32_t set = hit_set_index(pc);
+    uint64_t tag = hit_tag(pc);
+    int way = -1;
+    for (int w=0; w<HIT_WAYS; w++)
+        if (hit_table[cpu][set][w].valid && hit_table[cpu][set][w].tag == tag) { way = w; break; }
+    if (way < 0) {
+        int victim = 0; uint32_t oldest = 0xFFFFFFFF;
+        for (int w=0; w<HIT_WAYS; w++) {
+            if (!hit_table[cpu][set][w].valid) { victim = w; break; }
+            if (hit_table[cpu][set][w].lru < oldest) { oldest = hit_table[cpu][set][w].lru; victim = w; }
+        }
+        memset(&hit_table[cpu][set][victim], 0, sizeof(hit_entry_t));
+        hit_table[cpu][set][victim].tag   = tag;
+        hit_table[cpu][set][victim].valid = 1;
+        way = victim;
+    }
+    hit_entry_t *h = &hit_table[cpu][set][way];
+    h->lru = ++hit_lru_clock[cpu];
+    h->exec++;
+    if (!base_correct) h->mispred++;
+
+    /* --- admission test (fixed thresholds) --- */
+    uint32_t exec_th    = EXEC_BASE    + EXEC_PER_H2P    * n_h2p[cpu];
+    uint32_t mispred_th = MISPRED_BASE + MISPRED_PER_H2P * n_h2p[cpu];
+    if (!h->h2p_active && n_h2p[cpu] < MAX_H2P &&
+        h->exec >= exec_th && h->mispred >= mispred_th) {
+        double acc = 1.0 - (double)h->mispred / (double)h->exec;
+        if (acc < acc_ceiling(n_h2p[cpu])) {
+            h->h2p_active = 1;
+            admit_h2p(cpu, pc);
+        }
+    }
+
+    /* --- mini perceptron update + head-to-head scoring --- */
+    if (s_h2p_idx[cpu] >= 0 && h2p[cpu][s_h2p_idx[cpu]].valid &&
+        h2p[cpu][s_h2p_idx[cpu]].pc == pc) {
+        h2p_entry_t *e = &h2p[cpu][s_h2p_idx[cpu]];
+        uint8_t mini_pred = (s_mini_out[cpu] >= 0) ? 1 : 0;
+        bool mini_ok = (mini_pred == taken);
+        if (mini_ok && !base_correct) {
+            if (e->winrate < WINRATE_MAX) e->winrate++;
+        } else if (!mini_ok && base_correct) {
+            if (e->winrate > -WINRATE_MAX) e->winrate--;
+        }
+        mini_update(cpu, s_h2p_idx[cpu], taken, s_mini_out[cpu]);
+
+        // adaptive eviction: base wins decisively -> release slot
+        if (e->occurrences > WARMUP_OCC && e->winrate <= -WINRATE_MAX/2) {
+            e->valid = 0;
+            n_h2p[cpu]--;
+        }
+    }
+
+    /* --- base predictor update (always; no TAGE-filtering in modified version) --- */
+    bool b = taken;
+    for (int i=0; i<NGHIST_WORDS; i++) {
+        ghist_words[cpu][i] <<= 1;
+        ghist_words[cpu][i] |= b;
+        b = !!(ghist_words[cpu][i] & TABLE_SIZE);
+        ghist_words[cpu][i] &= TABLE_SIZE-1;
+    }
+    int a = (yout[cpu] < 0) ? -yout[cpu] : yout[cpu];
+    if (!base_correct || a < theta[cpu]) {
+        for (int i=0; i<NTABLES; i++) {
+            int *c = &tables[cpu][i][indices[cpu][i]];
+            if (taken) { if (*c < 127)  (*c)++; }
+            else       { if (*c > -128) (*c)--; }
+        }
+        if (!base_correct) {
+            tc[cpu]++;
+            if (tc[cpu] >= SPEED) { theta[cpu]++; tc[cpu] = 0; }
+        } else if (a < theta[cpu]) {
+            tc[cpu]--;
+            if (tc[cpu] <= -SPEED) { theta[cpu]--; tc[cpu] = 0; }
+        }
+    }
+}

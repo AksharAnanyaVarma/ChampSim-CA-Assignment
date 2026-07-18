@@ -1,0 +1,210 @@
+#include "cache.h"
+#include <cstdlib>
+
+// ===================================================================
+// HCIT: Hard-to-Cache Identification Table
+// Inspired by Bullseye (CBP 2025): a small subset of PCs accounts for
+// most misses. Track per-PC cache behaviour, and spend protection
+// resources only on the identified "hard-to-cache" tail.
+// ===================================================================
+
+#define maxRRPV 3
+uint32_t rrpv[LLC_SET][LLC_WAY];
+
+// --- Component 1: Hard-to-Cache Identification Table ---
+#define HCIT_SETS   64
+#define HCIT_WAYS   8
+#define HCIT_ENTRIES (HCIT_SETS*HCIT_WAYS)
+
+struct hcit_entry_t {
+    uint64_t tag;
+    uint32_t accesses;
+    uint32_t misses;
+    uint32_t inserts;     // blocks inserted by this PC that were evicted
+    uint32_t reused;      // of those, how many saw >=1 hit
+    uint8_t  valid;
+    uint8_t  protected_;  // currently receiving preferential treatment
+    uint32_t lru;
+};
+hcit_entry_t hcit[HCIT_SETS][HCIT_WAYS];
+uint32_t hcit_clock;
+uint32_t n_protected;
+
+// which PC inserted each block (for reuse attribution)
+uint64_t block_pc[LLC_SET][LLC_WAY];
+uint8_t  block_prot[LLC_SET][LLC_WAY];
+uint8_t  block_hit[LLC_SET][LLC_WAY];   // was this block reused before eviction?
+
+// --- Component 3: adaptive admission thresholds ---
+#define ACCESS_BASE      32
+#define ACCESS_PER_PROT  8
+#define MISS_BASE        16
+#define MISS_PER_PROT    4
+#define MAX_PROTECTED    32
+
+// Reuse floor rises as the protected population grows: protection is a
+// scarce resource, so later admissions must prove more reuse to earn it.
+static inline double reuse_floor(uint32_t N) {
+    if (N < 8)  return 0.08 + 0.01 * N;
+    if (N < 24) return 0.16 + 0.01 * (N - 8);
+    return 0.32;
+}
+#define TRAIN_MIN 8   // evicted samples needed before judging a PC
+
+// stats
+uint64_t stat_prot_inserts, stat_norm_inserts, stat_prot_hits, stat_admissions, stat_evictions;
+
+static inline uint32_t hcit_set(uint64_t ip) { return (ip >> 2) & (HCIT_SETS-1); }
+static inline uint64_t hcit_tag(uint64_t ip) { return (ip >> 2) >> 6; }
+
+static hcit_entry_t* hcit_lookup(uint64_t ip, bool allocate)
+{
+    if (!ip) return NULL;
+    uint32_t s = hcit_set(ip);
+    uint64_t t = hcit_tag(ip);
+    for (int w=0; w<HCIT_WAYS; w++)
+        if (hcit[s][w].valid && hcit[s][w].tag == t) {
+            hcit[s][w].lru = ++hcit_clock;
+            return &hcit[s][w];
+        }
+    if (!allocate) return NULL;
+
+    int victim = 0; uint32_t oldest = 0xFFFFFFFF;
+    for (int w=0; w<HCIT_WAYS; w++) {
+        if (!hcit[s][w].valid) { victim = w; break; }
+        if (hcit[s][w].lru < oldest) { oldest = hcit[s][w].lru; victim = w; }
+    }
+    if (hcit[s][victim].valid && hcit[s][victim].protected_) {
+        n_protected--;
+        stat_evictions++;
+    }
+    memset(&hcit[s][victim], 0, sizeof(hcit_entry_t));
+    hcit[s][victim].tag   = t;
+    hcit[s][victim].valid = 1;
+    hcit[s][victim].lru   = ++hcit_clock;
+    return &hcit[s][victim];
+}
+
+void CACHE::llc_initialize_replacement()
+{
+    cout << "Initialize LLC HCIT replacement policy "
+         << "(Hard-to-Cache Identification Table, adaptive thresholds)" << endl;
+    for (int i=0; i<LLC_SET; i++)
+        for (int j=0; j<LLC_WAY; j++) {
+            rrpv[i][j] = maxRRPV;
+            block_pc[i][j] = 0;
+            block_prot[i][j] = 0;
+            block_hit[i][j] = 0;
+        }
+    memset(hcit, 0, sizeof(hcit));
+    hcit_clock = 0; n_protected = 0;
+    stat_prot_inserts = stat_norm_inserts = stat_prot_hits = 0;
+    stat_admissions = stat_evictions = 0;
+}
+
+// --- Component 2: adaptive protection at victim selection ---
+uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // prefer an unprotected maxRRPV line; fall back to any maxRRPV line
+    for (int pass=0; pass<2; pass++) {
+        int guard = 0;
+        while (guard++ < 64) {
+            for (int i=0; i<LLC_WAY; i++)
+                if (rrpv[set][i] == maxRRPV && (pass == 1 || !block_prot[set][i]))
+                    return i;
+            for (int i=0; i<LLC_WAY; i++)
+                if (rrpv[set][i] < maxRRPV) rrpv[set][i]++;
+        }
+    }
+    return 0;
+}
+
+void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    if (hit && (type == WRITEBACK)) return;
+
+    if (hit) {
+        rrpv[set][way] = 0;
+        block_hit[set][way] = 1;              // observed reuse
+        if (block_prot[set][way]) stat_prot_hits++;
+        hcit_entry_t *e = hcit_lookup(ip, true);
+        if (e) e->accesses++;
+        return;
+    }
+
+    // ---- eviction training: the outgoing block teaches its owner PC ----
+    if (block_pc[set][way]) {
+        hcit_entry_t *owner = hcit_lookup(block_pc[set][way], false);
+        if (owner) {
+            owner->inserts++;
+            if (block_hit[set][way]) owner->reused++;
+        }
+    }
+
+    // ---- miss / fill path ----
+    hcit_entry_t *e = hcit_lookup(ip, true);
+    if (!e) {
+        rrpv[set][way] = maxRRPV-1;
+        block_pc[set][way] = 0;
+        block_prot[set][way] = 0;
+        stat_norm_inserts++;
+        return;
+    }
+
+    e->accesses++;
+    e->misses++;
+
+    // adaptive admission: thresholds tighten as protection becomes scarce
+    uint32_t acc_th  = ACCESS_BASE + ACCESS_PER_PROT * n_protected;
+    uint32_t miss_th = MISS_BASE   + MISS_PER_PROT   * n_protected;
+
+    // A PC is "hard-to-cache" only if it BOTH misses a lot (it matters)
+    // AND shows reuse (protection can actually help). High-miss/no-reuse
+    // PCs are streaming -- protecting them pollutes the cache.
+    if (!e->protected_ && n_protected < MAX_PROTECTED &&
+        e->accesses >= acc_th && e->misses >= miss_th &&
+        e->inserts >= TRAIN_MIN) {
+        double reuse_rate = (double)e->reused / (double)e->inserts;
+        if (reuse_rate >= reuse_floor(n_protected)) {
+            e->protected_ = 1;
+            n_protected++;
+            stat_admissions++;
+        }
+    }
+
+    // adaptive demotion: a protected PC that stops showing reuse loses status
+    if (e->protected_ && e->inserts >= TRAIN_MIN * 4) {
+        double reuse_rate = (double)e->reused / (double)e->inserts;
+        // demote well below the admission floor (hysteresis prevents thrash)
+        if (reuse_rate < reuse_floor(n_protected) * 0.5) {
+            e->protected_ = 0;
+            n_protected--;
+            stat_evictions++;
+        }
+    }
+
+    // protection = long-life insertion; everything else = short-life
+    if (e->protected_) {
+        rrpv[set][way] = 0;
+        block_prot[set][way] = 1;
+        stat_prot_inserts++;
+    } else {
+        // not yet identified as hard-to-cache -> standard SRRIP insertion
+        rrpv[set][way] = maxRRPV-1;
+        block_prot[set][way] = 0;
+        stat_norm_inserts++;
+    }
+    block_pc[set][way] = ip;
+    block_hit[set][way] = 0;
+}
+
+void CACHE::llc_replacement_final_stats()
+{
+    cout << endl << "=== HCIT Replacement Policy Stats ===" << endl;
+    cout << "HCIT admissions:        " << stat_admissions << endl;
+    cout << "HCIT demotions:         " << stat_evictions << endl;
+    cout << "Currently protected:    " << n_protected << endl;
+    cout << "Protected inserts:      " << stat_prot_inserts << endl;
+    cout << "Normal inserts:         " << stat_norm_inserts << endl;
+    cout << "Hits on protected blks: " << stat_prot_hits << endl;
+}
